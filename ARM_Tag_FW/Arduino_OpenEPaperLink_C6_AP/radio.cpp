@@ -116,6 +116,7 @@ bool radioTx(uint8_t *packet, bool subGhz) {
   led_flash(1);
   if (has_sub_ghz && subGhz) {
     tiRadioTxLL(packet);
+    return true;
   } else {
     static uint8_t txPKT[130];
     while (isInTransmit) {
