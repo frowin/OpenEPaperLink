@@ -12,8 +12,10 @@
 #include "leds.h"
 #include "serialap.h"
 #include "storage.h"
+#include "system.h"
 #include "tag_db.h"
 #include "util.h"
+#include "uploadinfo.h"
 #include "web.h"
 
 
@@ -46,17 +48,49 @@ void handleSysinfoRequest(AsyncWebServerRequest* request) {
     doc["flashsize"] = ESP.getFlashChipSize();
     doc["rollback"] = Update.canRollBack();
     doc["ap_version"] = apInfo.version;
+    doc["ap_type"] = apInfo.type;
+    doc["ap_typename"] = apTypeName(apInfo.type);
+    doc["channel"] = apInfo.channel;
+    doc["heapsize"] = ESP.getHeapSize();
+    doc["fssize"] = Storage.totalSpace();
+    doc["resetreason"] = resetReasonName();
+    doc["crashed"] = crashedLastBoot();
+    doc["ntpserver"] = ntpServerName();
+    doc["ntpsync"] = lastTimeSync();
+    doc["currtime"] = time(nullptr);
+#ifdef FLASHER_AP_SWS
+    doc["has_sws_flasher"] = 1;
+#else
+    doc["has_sws_flasher"] = 0;
+#endif
+    {
+        JsonObject fp = doc["flashpin_defaults"].to<JsonObject>();
+        fp["sws"] = (int)FLASH_DEF_SWS;
+        fp["reset"] = (int)FLASH_DEF_RESET;
+        fp["txd"] = (int)FLASH_DEF_TXD;
+        fp["rxd"] = (int)FLASH_DEF_RXD;
+        fp["prog"] = (int)FLASH_DEF_PROG;
+        fp["dbgtxd"] = (int)FLASH_DEF_DBGTXD;
+        fp["dbgrxd"] = (int)FLASH_DEF_DBGRXD;
+    }
 
     doc["hasC6"] = 0;
     doc["hasH2"] = 0;
     doc["hasTslr"] = 0;
 
+    /* Independent capabilities, not one exclusive choice. A radio co-processor
+       is either an H2 or a C6, so those two stay mutually exclusive - but an
+       SWS wired TLSR is a separate thing, and a board can carry either module.
+       While this was an #elif chain, declaring HAS_TSLR on a board that also
+       has a C6 silently reported hasC6 = 0. /get_ap_config already reports
+       them separately; this is the same fix for sysinfo. */
 #if defined HAS_H2
     doc["hasH2"] = 1;
-#elif defined HAS_TSLR
-    doc["hasTslr"] = 1;
 #elif defined C6_OTA_FLASHING
     doc["hasC6"] = 1;
+#endif
+#if defined(FLASHER_AP_SWS) || defined(HAS_TSLR)
+    doc["hasTslr"] = 1;
 #endif
 
 #ifdef HAS_EXT_FLASHER
@@ -106,83 +140,33 @@ void handleCheckFile(AsyncWebServerRequest* request) {
     request->send(200, "application/json", jsonResponse);
 }
 
-#define UPLOAD_BUFFER_SIZE 32768
-
-struct UploadInfo {
-    String filename;
-    uint8_t buffer[UPLOAD_BUFFER_SIZE];
-    size_t bufferSize;
-};
-
 void handleLittleFSUpload(AsyncWebServerRequest* request, String filename, size_t index, uint8_t* data, size_t len, bool final) {
-    String uploadfilename;
-    bool error = false;
     if (!index) {
-        String path;
         if (!request->hasParam("path", true)) {
-            final = true;
-            error = true;
-        } else {
-            uploadfilename = request->getParam("path", true)->value();
-            Serial.println("update " + uploadfilename);
-            File file = contentFS->open(uploadfilename, "w");
-            file.close();
-            UploadInfo* uploadInfo = new UploadInfo{uploadfilename, {}, 0};
-            request->_tempObject = (void*)uploadInfo;
+            request->send(400, "text/plain", "parameters incomplete");
+            return;
         }
+        const String uploadfilename = request->getParam("path", true)->value();
+        Serial.println("update " + uploadfilename);
+        if (beginUpload(request, uploadfilename) == nullptr) return;
     }
 
     UploadInfo* uploadInfo = static_cast<UploadInfo*>(request->_tempObject);
+    if (uploadInfo == nullptr) return;
 
-    if (uploadInfo != nullptr) {
-        uploadfilename = uploadInfo->filename;
+    if (len) appendUploadInfo(uploadInfo, data, len);
+    if (!final) return;
 
-        if (len) {
-            if (uploadInfo->bufferSize + len <= UPLOAD_BUFFER_SIZE) {
-                memcpy(&uploadInfo->buffer[uploadInfo->bufferSize], data, len);
-                uploadInfo->bufferSize += len;
-            } else {
-                xSemaphoreTake(fsMutex, portMAX_DELAY);
-                File file = contentFS->open(uploadfilename, "a");
-                if (file) {
-                    file.write(uploadInfo->buffer, uploadInfo->bufferSize);
-                    file.close();
-                    uploadInfo->bufferSize = 0;
-                    xSemaphoreGive(fsMutex);
-                } else {
-                    xSemaphoreGive(fsMutex);
-                    logLine("Failed to open file for appending: " + uploadfilename);
-                    final = true;
-                    error = true;
-                }
+    flushUploadInfo(uploadInfo);
+    const bool error = uploadInfo->error;
+    if (error) logLine("Failed to write " + String(uploadInfo->filename));
+    request->_tempObject = nullptr;
+    free(uploadInfo);
 
-                memcpy(uploadInfo->buffer, data, len);
-                uploadInfo->bufferSize = len;
-            }
-        }
-        if (final) {
-            if (uploadInfo->bufferSize > 0) {
-                xSemaphoreTake(fsMutex, portMAX_DELAY);
-                File file = contentFS->open(uploadfilename, "a");
-                if (file) {
-                    file.write(uploadInfo->buffer, uploadInfo->bufferSize);
-                    file.close();
-                    xSemaphoreGive(fsMutex);
-                } else {
-                    xSemaphoreGive(fsMutex);
-                    logLine("Failed to open file for appending: " + uploadfilename);
-                    error = true;
-                }
-                request->_tempObject = nullptr;
-                delete uploadInfo;
-            }
-
-            if (error) {
-                request->send(507, "text/plain", "Error. Disk full?");
-            } else {
-                request->send(200, "text/plain", "Ok, file written");
-            }
-        }
+    if (error) {
+        request->send(507, "text/plain", "Error. Disk full?");
+    } else {
+        request->send(200, "text/plain", "Ok, file written");
     }
 }
 
@@ -257,7 +241,15 @@ void updateFirmware(const char* url, const char* expectedMd5, const size_t size)
                 }
             });
 
-            const size_t written = Update.writeStream(httpClient.getStream());
+            // writeStream() checks the image header with a non-blocking peek() first: when the body
+            // hasn't arrived yet (GET() returns after the headers), that fails at once, as a wrong
+            // magic byte. Wait for the first bytes.
+            WiFiClient &stream = httpClient.getStream();
+            const uint32_t waitStart = millis();
+            while (stream.available() == 0 && stream.connected() && millis() - waitStart < 10000) {
+                vTaskDelay(10 / portTICK_PERIOD_MS);
+            }
+            const size_t written = Update.writeStream(stream);
             if (written == httpClient.getSize()) {
                 if (Update.end(true)) {
                     wsSerial("Firmware update successful");
@@ -359,9 +351,9 @@ void C6firmwareUpdateTask(void* parameter) {
 
     if (result) {
        wsSerial("Finished!");
-       char buffer[50];
-       snprintf(buffer,sizeof(buffer),
-                "ESP32-" SHORT_CHIP_NAME " version is now %04x", apInfo.version);
+       char buffer[80];
+       snprintf(buffer, sizeof(buffer), "AP is now type %02X (%s), firmware version %04X",
+                apInfo.type, apTypeName(apInfo.type), apInfo.version);
        wsSerial(String(buffer));
     }
     else if(apInfo.version == 0) {
@@ -370,9 +362,15 @@ void C6firmwareUpdateTask(void* parameter) {
     else {
        wsSerial("Flashing failed. :-(");
     }
-    // wsSerial("Reboot system now");
-    // wsSerial("[reboot]");
     free(urlPtr);
+
+    if (result) {
+        wsSerial("[autoreboot]");
+        vTaskDelay(1500 / portTICK_PERIOD_MS);
+        ESP.restart();
+    }
+
+    wsSerial("[reboot]");
     vTaskDelay(30000 / portTICK_PERIOD_MS);
     vTaskDelete(NULL);
 }

@@ -31,6 +31,7 @@
 #include "web.h"
 #ifdef HAS_BLE_WRITER
 #include "ble_writer.h"
+#include "tlsr_flasher.h"
 #endif
 
 util::Timer intervalContentRunner(seconds(1));
@@ -122,6 +123,7 @@ void setup() {
     }
     */
 
+    enableNtpFromDhcp();
     wm.initEth();
     initAPconfig();
 
@@ -195,6 +197,7 @@ void setup() {
 void loop() {
     ws.cleanupClients();
     wm.poll();
+    handleRestartRequest();
 
     if (intervalSysinfo.doRun()) {
         wsSendSysteminfo();

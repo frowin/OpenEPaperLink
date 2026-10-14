@@ -37,6 +37,9 @@ uint8_t gicToOEPLtype(uint8_t gicType) {
         case 0x2B:
             return GICI_BLE_EPD_29_BWR;
             break;
+        case 0x2E:
+            return GICI_BLE_EPD_29_BWRY;
+            break;
         case 0x33:
             return GICI_BLE_EPD_29_BWR1;
             break;
@@ -272,8 +275,7 @@ bool BLE_is_image_pending(uint8_t address[8]) {
     // finish even while some tags stay offline.
     tagRecord* best = nullptr;
     uint32_t bestAttempts = 0;
-    for (int16_t c = 0; c < tagDB.size(); c++) {
-        tagRecord* taginfo = tagDB.at(c);
+    for (tagRecord* taginfo : tagDBSnapshot()) {
         if (!BLE_isPendingCandidate(taginfo)) continue;
         uint32_t attempts = BLE_attemptCounts[BLE_macToKey(taginfo->mac)];
         if (best == nullptr || attempts < bestAttempts) {
@@ -299,7 +301,24 @@ uint8_t swapBits(uint8_t num) {
     return result;
 }
 
-uint32_t compress_image(uint8_t address[8], uint8_t* buffer, uint32_t max_len) {
+// Packed 2-bit palette data is already in its final on-air representation and
+// must bypass the older Gicisky bit-plane compressor.
+static uint32_t copy_packed_2bit_image(uint8_t* buffer, uint8_t* src, uint32_t src_len,
+                                       uint16_t width_display, uint16_t height_display,
+                                       uint32_t max_len) {
+    const uint32_t output_len = ((uint32_t)width_display * height_display + 3) / 4;
+    if (src_len != output_len || output_len > max_len) {
+        Serial.printf("BLE invalid packed 2bpp frame: src=%u expected=%u max=%u\r\n",
+                      src_len, output_len, max_len);
+        return 0;
+    }
+
+    memcpy(buffer, src, output_len);
+    Serial.printf("BLE direct packed 2bpp frame: %u bytes\r\n", output_len);
+    return output_len;
+}
+
+uint32_t compress_image(uint8_t address[8], uint8_t* buffer, uint32_t max_len, uint8_t imageBpp) {
     uint32_t t = millis();
     PendingItem* queueItem = getQueueItem(address, 0);
     if (queueItem == nullptr) {
@@ -307,16 +326,10 @@ uint32_t compress_image(uint8_t address[8], uint8_t* buffer, uint32_t max_len) {
         Serial.printf("blockrequest: couldn't find taginfo %02X%02X%02X%02X%02X%02X%02X%02X\r\n", address[7], address[6], address[5], address[4], address[3], address[2], address[1], address[0]);
         return 0;
     }
-    if (queueItem->data == nullptr) {
-        fs::File file = contentFS->open(queueItem->filename);
-        if (!file) {
-            Serial.print("No current file. " + String(queueItem->filename) + " Canceling request\r\n");
-            prepareCancelPending(address);
-            return 0;
-        }
-        queueItem->data = getDataForFile(file);
-        Serial.println("Reading file " + String(queueItem->filename) + " in  " + String(millis() - t) + "ms");
-        file.close();
+    if (!loadQueueItemData(queueItem)) {
+        Serial.print("No data for " + String(queueItem->filename) + ", canceling request\r\n");
+        prepareCancelPending(address);
+        return 0;
     }
 
     uint16_t giciType = (address[7] << 8) | address[6];  // here we "extract" the display info again
@@ -424,6 +437,11 @@ uint32_t compress_image(uint8_t address[8], uint8_t* buffer, uint32_t max_len) {
             break;
     }
 
+    if (imageBpp == BPP_PACKED_2BIT) {
+        return copy_packed_2bit_image(buffer, queueItem->data, queueItem->len,
+                                      width_display, height_display, max_len);
+    }
+
     uint32_t len_compressed = 0;
     if (canDoCompression)
         len_compressed = 4;
@@ -520,16 +538,10 @@ uint32_t get_ATC_BLE_OEPL_image(uint8_t address[8], uint8_t* buffer, uint32_t ma
         Serial.printf("blockrequest: couldn't find taginfo %02X%02X%02X%02X%02X%02X%02X%02X\r\n", address[7], address[6], address[5], address[4], address[3], address[2], address[1], address[0]);
         return 0;
     }
-    if (queueItem->data == nullptr) {
-        fs::File file = contentFS->open(queueItem->filename);
-        if (!file) {
-            Serial.print("No current file. " + String(queueItem->filename) + " Canceling request\r\n");
-            prepareCancelPending(address);
-            return 0;
-        }
-        queueItem->data = getDataForFile(file);
-        Serial.println("Reading file " + String(queueItem->filename) + " in  " + String(millis() - t) + "ms");
-        file.close();
+    if (!loadQueueItemData(queueItem)) {
+        Serial.print("No data for " + String(queueItem->filename) + ", canceling request\r\n");
+        prepareCancelPending(address);
+        return 0;
     }
     if (queueItem->len > max_len) {
         Serial.print("The upload is too big better cencel it\r\n");
